@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Dump the mesh geometry of a 3MF package into a binary STL.
+
+Only geometry is read: the slicer configuration a 3MF project carries (printer,
+filament, process, per-object extruder) is never touched, so the resulting STL
+cannot change the settings of whatever opens it.
+
+    ./3mf2stl model.3mf model.stl
+
+Both package layouts are supported: a self-contained model part, and the 3MF
+Production Extension where the root part holds nothing but references (p:path)
+to sibling parts, each with its own object id space.
+"""
+
+from __future__ import annotations
+
+import struct
+import sys
+import zipfile
+from typing import Iterator
+from xml.etree import ElementTree
+
+CORE = "{http://schemas.microsoft.com/3dmanufacturing/core/2015/02}"
+PRODUCTION = "{http://schemas.microsoft.com/3dmanufacturing/production/2015/06}"
+ENTRY_MODEL = "3D/3dmodel.model"
+
+# A 3MF carries its own unit; STL does not, and every consumer assumes millimetres.
+MM_PER_UNIT = {
+    "micron": 0.001,
+    "millimeter": 1.0,
+    "centimeter": 10.0,
+    "inch": 25.4,
+    "foot": 304.8,
+    "meter": 1000.0,
+}
+
+# Guards against a package that references itself in circles.
+MAX_NESTING = 32
+
+FACET = struct.Struct("<12fH")
+TRIANGLE_COUNT = struct.Struct("<I")
+
+
+class PackageError(Exception):
+    """Raised when a 3MF cannot be turned into geometry."""
+
+
+class Transform:
+    """Row-major affine 4x3 transform, as stored in 3MF `transform` attributes."""
+
+    __slots__ = ("_v",)
+
+    def __init__(self, values: list[float]) -> None:
+        self._v = values
+
+    @classmethod
+    def unit(cls) -> "Transform":
+        return cls([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+
+    @classmethod
+    def from_attribute(cls, text: str) -> "Transform":
+        values = [float(part) for part in text.split()]
+        if len(values) != 12:
+            raise PackageError(f"transform holds {len(values)} numbers, expected 12: {text!r}")
+        return cls(values)
+
+    def point(self, vertex: tuple[float, float, float]) -> tuple[float, float, float]:
+        x, y, z = vertex
+        v = self._v
+        return (
+            x * v[0] + y * v[3] + z * v[6] + v[9],
+            x * v[1] + y * v[4] + z * v[7] + v[10],
+            x * v[2] + y * v[5] + z * v[8] + v[11],
+        )
+
+    def then(self, outer: "Transform") -> "Transform":
+        """This transform applied first, `outer` second."""
+        inner, a = self._v, outer._v
+        result = [0.0] * 12
+        for row in range(3):
+            for col in range(3):
+                result[row * 3 + col] = sum(inner[row * 3 + k] * a[k * 3 + col] for k in range(3))
+            result[9 + row] = sum(inner[9 + k] * a[k * 3 + row] for k in range(3)) + a[9 + row]
+        return Transform(result)
+
+
+class Mesh:
+    """A concrete mesh resource: vertices plus the triangles indexing them."""
+
+    __slots__ = ("vertices", "triangles")
+
+    def __init__(self, element: ElementTree.Element) -> None:
+        self.vertices = [
+            (float(v.get("x")), float(v.get("y")), float(v.get("z")))
+            for v in element.iter(f"{CORE}vertex")
+        ]
+        self.triangles = [
+            (int(t.get("v1")), int(t.get("v2")), int(t.get("v3")))
+            for t in element.iter(f"{CORE}triangle")
+        ]
+
+
+class Group:
+    """A resource that only places other resources, possibly from another part."""
+
+    __slots__ = ("members",)
+
+    def __init__(self, element: ElementTree.Element) -> None:
+        self.members = [
+            (
+                c.get("objectid"),
+                (c.get(PRODUCTION + "path") or "").lstrip("/"),
+                Transform.from_attribute(c.get("transform")) if c.get("transform") else None,
+            )
+            for c in element.findall(f"{CORE}component")
+        ]
+
+
+class Placement:
+    """A root-level `<item>`: what the build actually puts on the plate."""
+
+    __slots__ = ("objectid", "part", "transform")
+
+    def __init__(self, element: ElementTree.Element) -> None:
+        self.objectid = element.get("objectid")
+        self.part = (element.get(PRODUCTION + "path") or "").lstrip("/") or None
+        attribute = element.get("transform")
+        self.transform = Transform.from_attribute(attribute) if attribute else None
+
+
+class Package:
+    """Every model part of an archive, indexed by (part, object id)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.resources: dict[tuple[str, str], Mesh | Group] = {}
+        self.placements: list[Placement] = []
+        self.scale = 1.0
+        with zipfile.ZipFile(path) as archive:
+            parts = [n for n in archive.namelist() if n.endswith(".model")]
+            if ENTRY_MODEL not in parts:
+                raise PackageError(f"{path}: no {ENTRY_MODEL} in the archive")
+            for name in parts:
+                self._index(name, archive.read(name))
+        if not self.placements:
+            raise PackageError(f"{path}: build section is empty, nothing to export")
+
+    def _index(self, part: str, data: bytes) -> None:
+        root = ElementTree.fromstring(data)
+        for element in root.iter(f"{CORE}object"):
+            mesh = element.find(f"{CORE}mesh")
+            if mesh is not None:
+                self.resources[(part, element.get("id"))] = Mesh(mesh)
+            else:
+                group = element.find(f"{CORE}components")
+                if group is not None:
+                    self.resources[(part, element.get("id"))] = Group(group)
+        if part == ENTRY_MODEL:
+            self.placements.extend(Placement(i) for i in root.iter(f"{CORE}item"))
+            self.scale = self._unit_scale(root.get("unit", "millimeter"))
+
+    def _unit_scale(self, unit: str) -> float:
+        try:
+            return MM_PER_UNIT[unit]
+        except KeyError:
+            raise PackageError(f"{self.path}: unknown unit {unit!r}") from None
+
+    def facets(self) -> Iterator[tuple[tuple[float, float, float], ...]]:
+        """Yield every triangle of the build, already in millimetres."""
+        todo = [
+            (item.part or ENTRY_MODEL, item.objectid, item.transform or Transform.unit(), 0)
+            for item in reversed(self.placements)
+        ]
+        while todo:
+            part, objectid, transform, depth = todo.pop()
+            if depth > MAX_NESTING:
+                raise PackageError(f"{self.path}: components nested deeper than {MAX_NESTING} in {part}")
+            resource = self.resources.get((part, objectid))
+            if resource is None:
+                raise PackageError(f"{self.path}: object id {objectid!r} missing in {part}")
+            if isinstance(resource, Mesh):
+                vertices = resource.vertices
+                for a, b, c in resource.triangles:
+                    yield tuple(transform.point(vertices[n]) for n in (a, b, c))
+            else:
+                for member_id, member_part, member_transform in reversed(resource.members):
+                    placed = transform if member_transform is None else member_transform.then(transform)
+                    todo.append((member_part or part, member_id, placed, depth + 1))
+
+
+def facet_normal(vertices: tuple[tuple[float, float, float], ...]) -> tuple[float, float, float]:
+    (ax, ay, az), (bx, by, bz), (cx, cy, cz) = vertices
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+    length = (nx * nx + ny * ny + nz * nz) ** 0.5
+    if length == 0.0:  # degenerate facet: the spec allows a zero normal
+        return (0.0, 0.0, 0.0)
+    return (nx / length, ny / length, nz / length)
+
+
+def write_stl(package: Package, destination: str) -> int:
+    written = 0
+    with open(destination, "wb") as out:
+        out.write(b"3mf2stl".ljust(80, b"\0"))
+        out.write(TRIANGLE_COUNT.pack(0))  # patched once the count is known
+        for vertices in package.facets():
+            scaled = tuple(package.scale * value for point in vertices for value in point)
+            out.write(FACET.pack(*facet_normal(vertices), *scaled, 0))
+            written += 1
+        out.seek(80)
+        out.write(TRIANGLE_COUNT.pack(written))
+    return written
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3:
+        print(f"usage: {argv[0]} input.3mf output.stl", file=sys.stderr)
+        return 2
+    try:
+        count = write_stl(Package(argv[1]), argv[2])
+    except (PackageError, OSError, zipfile.BadZipFile) as failure:
+        print(f"3mf2stl: {failure}", file=sys.stderr)
+        return 1
+    print(f"{count} triangles -> {argv[2]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
