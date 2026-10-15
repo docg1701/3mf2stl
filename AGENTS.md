@@ -5,7 +5,7 @@
 ## Rules
 
 - Python 3 standard library only. No dependencies, no venv, no pip, no build step, no vendored code.
-- One file, `3mf2stl`. CLI stays `3mf2stl <input.3mf> <output.stl>`.
+- One file, `3mf2stl`. CLI stays `3mf2stl <input.3mf> [input.3mf ...]`: one `.stl` per input, same name, same directory, never an output argument.
 - Never open `Metadata/`: printer, filament, process and per-object extruder live there.
 - Fail loud: raise `PackageError` with the offending value. No fallbacks, no partial output.
 - Geometry only: no repair, no validation, no materials, no extra flags.

@@ -5,7 +5,10 @@ Only geometry is read: the slicer configuration a 3MF project carries (printer,
 filament, process, per-object extruder) is never touched, so the resulting STL
 cannot change the settings of whatever opens it.
 
-    ./3mf2stl model.3mf model.stl
+    ./3mf2stl model.3mf [more.3mf ...]
+
+Each input gets an STL of the same name beside it, so a shell glob converts a
+whole directory in one call.
 
 Both package layouts are supported: a self-contained model part, and the 3MF
 Production Extension where the root part holds nothing but references (p:path)
@@ -17,6 +20,7 @@ from __future__ import annotations
 import struct
 import sys
 import zipfile
+from pathlib import Path
 from typing import Iterator
 from xml.etree import ElementTree
 
@@ -136,17 +140,23 @@ class Package:
         self.resources: dict[tuple[str, str], Mesh | Group] = {}
         self.placements: list[Placement] = []
         self.scale = 1.0
-        with zipfile.ZipFile(path) as archive:
-            parts = [n for n in archive.namelist() if n.endswith(".model")]
-            if ENTRY_MODEL not in parts:
-                raise PackageError(f"{path}: no {ENTRY_MODEL} in the archive")
-            for name in parts:
-                self._index(name, archive.read(name))
+        try:
+            with zipfile.ZipFile(path) as archive:
+                parts = [n for n in archive.namelist() if n.endswith(".model")]
+                if ENTRY_MODEL not in parts:
+                    raise PackageError(f"{path}: no {ENTRY_MODEL} in the archive")
+                for name in parts:
+                    self._index(name, archive.read(name))
+        except zipfile.BadZipFile:
+            raise PackageError(f"{path}: not a 3MF, the archive cannot be read") from None
         if not self.placements:
             raise PackageError(f"{path}: build section is empty, nothing to export")
 
     def _index(self, part: str, data: bytes) -> None:
-        root = ElementTree.fromstring(data)
+        try:
+            root = ElementTree.fromstring(data)
+        except ElementTree.ParseError as failure:
+            raise PackageError(f"{self.path}: malformed XML in {part}: {failure}") from None
         for element in root.iter(f"{CORE}object"):
             mesh = element.find(f"{CORE}mesh")
             if mesh is not None:
@@ -199,7 +209,7 @@ def facet_normal(vertices: tuple[tuple[float, float, float], ...]) -> tuple[floa
     return (nx / length, ny / length, nz / length)
 
 
-def write_stl(package: Package, destination: str) -> int:
+def write_stl(package: Package, destination: Path) -> int:
     written = 0
     with open(destination, "wb") as out:
         out.write(b"3mf2stl".ljust(80, b"\0"))
@@ -213,17 +223,34 @@ def write_stl(package: Package, destination: str) -> int:
     return written
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print(f"usage: {argv[0]} input.3mf output.stl", file=sys.stderr)
-        return 2
+def convert(source: str) -> tuple[int, Path]:
+    """Write the STL twin beside its 3MF. Returns the triangle count and the output path."""
+    destination = Path(source).with_suffix(".stl")
+    if destination == Path(source):
+        raise PackageError(f"{source}: output would overwrite the input")
+    package = Package(source)  # fails before the destination is touched
     try:
-        count = write_stl(Package(argv[1]), argv[2])
-    except (PackageError, OSError, zipfile.BadZipFile) as failure:
-        print(f"3mf2stl: {failure}", file=sys.stderr)
-        return 1
-    print(f"{count} triangles -> {argv[2]}")
-    return 0
+        written = write_stl(package, destination)
+    except Exception:
+        destination.unlink(missing_ok=True)  # never leave a half-written STL behind
+        raise
+    return written, destination
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(f"usage: {argv[0]} input.3mf [input.3mf ...]", file=sys.stderr)
+        return 2
+    failures = 0
+    for source in argv[1:]:
+        try:
+            count, destination = convert(source)
+        except (PackageError, OSError) as failure:
+            print(f"3mf2stl: {failure}", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"{count} triangles -> {destination}")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
